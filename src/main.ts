@@ -48,6 +48,7 @@ function parseReasons(s: string): Set<string> | null {
   const set = new Set(s.split(",").map((r) => r.trim()).filter(Boolean));
   const unknown = [...set].filter((r) => !KNOWN_REASONS.has(r));
   if (unknown.length) throw new Error(`unknown REASONS: ${unknown.join(", ")}`);
+  if (!set.size) throw new Error("REASONS lists no reason");
   return set;
 }
 // A single hung request then fails inside the run and reaches fail(). A whole run can still
@@ -161,7 +162,6 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   } catch (e) {
     return fail(cfg, state, (e as Error).message);
   }
-  state.etag = etag;
   state.lastError = undefined;
 
   // First success: start from now instead of replaying the inbox.
@@ -196,12 +196,13 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     seen[t.id] = t.updated_at;
   }
   if (error) {
-    // Keep since and drop the ETag so the unsent threads come back next run.
+    // Keep since and the old ETag; the unsent threads come back next run.
     state.seen = seen;
-    state.etag = undefined;
     writeState(cfg.stateFile, state);
     throw new Error(`sent ${sent}, then ${error}`);
   }
+  // The ETag is saved only now: a run killed mid-loop must not let a 304 hide the unsent threads.
+  state.etag = etag;
   state.since = nextSince;
   state.seen = keep(seen);
   writeState(cfg.stateFile, state);
@@ -300,10 +301,11 @@ if (import.meta.main) {
       const id = opt(process.env, "GITHUB_OAUTH_CLIENT_ID");
       if (!id) throw new Error("GITHUB_OAUTH_CLIENT_ID is not set");
       console.log(await login(id, (opt(process.env, "GITHUB_WEB") ?? "https://github.com").replace(/\/$/, "")));
-      process.exit(0);
+    } else if (cmd !== undefined) {
+      throw new Error(`unknown command: ${cmd} (only "login", or no argument to poll)`);
+    } else {
+      console.log(await run(loadConfig(process.env)));
     }
-    if (cmd !== undefined) throw new Error(`unknown command: ${cmd} (only "login", or no argument to poll)`);
-    console.log(await run(loadConfig(process.env)));
   } catch (e) {
     console.error((e as Error).message);
     process.exit(1);

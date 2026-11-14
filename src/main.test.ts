@@ -167,7 +167,7 @@ test("304 replays the ETag and leaves since and seen alone", async () => {
   await poll(61);
   ghStatus = 304;
   expect(await poll(400)).toBe("not modified");
-  expect(ghReqs.map((r) => r.inm)).toEqual([null, ETAG, ETAG]);
+  expect(ghReqs.map((r) => r.inm)).toEqual([null, null, ETAG]);
   expect(state().since).toBe(at(-59));
   expect(state().seen).toEqual({ "1": at(30) });
 });
@@ -176,8 +176,10 @@ test("a 200 without an ETag stops sending If-None-Match", async () => {
   await poll(0);
   ghEtag = null;
   await poll(61);
+  ghEtag = ETAG;
   await poll(122);
-  expect(ghReqs.map((r) => r.inm)).toEqual([null, ETAG, null]);
+  await poll(183);
+  expect(ghReqs.map((r) => r.inm)).toEqual([null, null, null, ETAG]);
 });
 
 test("304 before any success does not count as a baseline", async () => {
@@ -215,12 +217,27 @@ test("an ntfy failure keeps since and resends only the unsent threads", async ()
   expect(ghReqs[2].inm).toBeNull();
 });
 
-test("a send survives the run being killed afterwards", async () => {
+test("a send survives the run being killed afterwards, and the ETag waits for the end", async () => {
+  ghEtag = null;
   await poll(0);
+  ghEtag = ETAG;
   ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
   ntfyFailOnce = 2;
   await expect(poll(61)).rejects.toThrow();
   expect(state().seen).toEqual({ "1": at(30) });
+  expect(state().etag).toBeUndefined();
+});
+
+test("the ETag is saved after a run that sent everything", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  await poll(61);
+  expect(state().etag).toBe(ETAG);
+});
+
+test("the baseline run does not save an ETag", async () => {
+  await poll(0);
+  expect(state().etag).toBeUndefined();
 });
 
 test("reads every page, without If-Modified-Since after the first", async () => {
@@ -229,8 +246,22 @@ test("reads every page, without If-Modified-Since after the first", async () => 
   ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
   expect(await poll(61)).toBe("sent 2");
   expect(ghReqs.slice(1).map((r) => [r.page, r.inm, r.auth])).toEqual([
-    [null, ETAG, "Bearer gh-test"],
+    [null, null, "Bearer gh-test"],
     ["2", null, "Bearer gh-test"],
+  ]);
+});
+
+test("pages after the first never carry the ETag", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  await poll(61);
+  ghPerPage = 1;
+  ghThreads.push(thread("2", "mention", 70), thread("3", "mention", 71));
+  expect(await poll(122)).toBe("sent 2");
+  expect(ghReqs.slice(2).map((r) => [r.page, r.inm])).toEqual([
+    [null, ETAG],
+    ["2", null],
+    ["3", null],
   ]);
 });
 
@@ -299,6 +330,7 @@ test("REASONS accepts any case of all and refuses unknown reasons", () => {
   expect(loadConfig({ ...base, REASONS: "All" }).reasons).toBeNull();
   expect([...(loadConfig({ ...base, REASONS: "state_change, comment" }).reasons ?? [])]).toEqual(["state_change", "comment"]);
   expect(() => loadConfig({ ...base, REASONS: "mention,review-requested" })).toThrow("unknown REASONS: review-requested");
+  expect(() => loadConfig({ ...base, REASONS: "," })).toThrow("REASONS lists no reason");
 });
 
 test("empty env values fall back to defaults", () => {
