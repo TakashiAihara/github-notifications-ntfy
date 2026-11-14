@@ -2,13 +2,13 @@
 
 Forwards new GitHub notifications from your inbox to an [ntfy](https://ntfy.sh) topic.
 
-It polls the REST endpoint `GET /notifications` once per run and is meant to be started by a timer about once a minute. It never uses GraphQL. Each request carries `If-Modified-Since`, so an unchanged inbox returns `304 Not Modified`, which GitHub does not count against the rate limit. The `X-Poll-Interval` header is honoured: a run that starts too early exits without calling GitHub.
+It polls the REST endpoint `GET /notifications` once per run and is meant to be started by a timer about once a minute. It never uses GraphQL. Each request carries the previous `ETag` in `If-None-Match`, so an unchanged answer returns `304 Not Modified`, which GitHub does not count against the rate limit (GitHub ignores `If-Modified-Since` on this endpoint). The `X-Poll-Interval` header is honoured: a run that starts too early exits without calling GitHub.
 
 ## Behaviour
 
 - Each poll asks only for threads updated since the previous poll (`since`, reaching back two minutes so nothing is missed between polls; repeats inside that window are dropped). The rest of the inbox is never read, however many unread threads it holds.
-- The first successful run starts from that moment and sends nothing.
-- Later runs send one ntfy message per updated thread whose `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit.
+- The first successful run sends nothing; the next run picks up updates from two minutes before it.
+- Later runs send one ntfy message per updated thread whose `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit. State is saved after each message, so a run killed mid-way does not send the same thread twice.
 - Notifications are not marked as read.
 - If an ntfy POST fails, the threads not yet sent are sent again on the next run, and the run exits non-zero.
 - If GitHub returns an error (for example an expired token), an ntfy message is sent when the error changes (not on every run while it repeats), and the run exits non-zero. If that message cannot be sent, it is tried again on the next run.
@@ -25,11 +25,11 @@ Environment variables:
 | `GITHUB_NOTIFICATIONS_TOKEN` | yes | |
 | `NTFY_URL` | yes (topic URL) | |
 | `NTFY_TOKEN` | no | |
-| `REASONS` | no (`all` sends every reason) | `mention,team_mention,review_requested,ci_activity` |
+| `REASONS` | no (`all` sends every reason; unknown names are refused) | `mention,team_mention,review_requested,ci_activity` |
 | `STATE_FILE` | no | `/var/lib/github-notifications-ntfy/state.json` |
 | `GITHUB_API` | no | `https://api.github.com` |
 
-Empty values (`REASONS=`) count as unset. `login` reads `GITHUB_OAUTH_CLIENT_ID` and, optionally, `GITHUB_WEB` (default `https://github.com`).
+Empty values (`REASONS=`) count as unset. `login` reads `GITHUB_OAUTH_CLIENT_ID` and, optionally, `GITHUB_WEB` (default `https://github.com`). Click links always point at github.com; GitHub Enterprise is not supported.
 
 ## Token
 

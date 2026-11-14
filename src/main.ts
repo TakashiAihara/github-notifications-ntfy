@@ -17,7 +17,8 @@ type Thread = {
 type State = {
   // Lower bound for the next query; unset until the first successful poll.
   since?: string;
-  lastModified?: string;
+  // ETag of the last 200; GitHub answers 304 to If-None-Match (it ignores If-Modified-Since here).
+  etag?: string;
   nextPollAt?: number;
   // Threads already handled inside the overlap window, keyed by id with their updated_at.
   seen: Record<string, string>;
@@ -34,7 +35,23 @@ export type Config = {
 };
 
 const DEFAULT_REASONS = "mention,team_mention,review_requested,ci_activity";
-// Each request must finish well inside the unit's TimeoutStartSec=50 so failures reach fail().
+// From the "About notification reasons" table in the GitHub REST docs.
+const KNOWN_REASONS = new Set([
+  "agent_session_finished", "approval_requested", "assign", "author", "ci_activity", "comment", "invitation", "manual",
+  "member_feature_requested", "mention", "review_requested", "security_advisory_credit",
+  "security_alert", "state_change", "subscribed", "team_mention",
+]);
+
+// A typo would silently forward nothing, so unknown reasons are refused.
+function parseReasons(s: string): Set<string> | null {
+  if (s.toLowerCase() === "all") return null;
+  const set = new Set(s.split(",").map((r) => r.trim()).filter(Boolean));
+  const unknown = [...set].filter((r) => !KNOWN_REASONS.has(r));
+  if (unknown.length) throw new Error(`unknown REASONS: ${unknown.join(", ")}`);
+  return set;
+}
+// A single hung request then fails inside the run and reaches fail(). A whole run can still
+// outlast the unit's TimeoutStartSec; sends are checkpointed so a killed run does not resend.
 const TIMEOUT_MS = 10_000;
 const POLL_SLACK_MS = 5_000;
 // Each query reaches back this far before the previous start, so an update landing
@@ -53,7 +70,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     githubApi: (opt(env, "GITHUB_API") ?? "https://api.github.com").replace(/\/$/, ""),
     ntfyUrl: need("NTFY_URL"),
     ntfyToken: env.NTFY_TOKEN?.trim() || undefined,
-    reasons: reasons === "all" ? null : new Set(reasons.split(",").map((s) => s.trim()).filter(Boolean)),
+    reasons: parseReasons(reasons),
     stateFile: opt(env, "STATE_FILE") ?? "/var/lib/github-notifications-ntfy/state.json",
   };
 }
@@ -114,7 +131,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": "github-notifications-ntfy",
   };
-  if (state.lastModified) headers["If-Modified-Since"] = state.lastModified;
+  if (state.etag) headers["If-None-Match"] = state.etag;
 
   let res: Response;
   try {
@@ -129,31 +146,29 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   const nextSince = iso(now - OVERLAP_MS);
   const keep = (seen: Record<string, string>) => Object.fromEntries(Object.entries(seen).filter(([, u]) => u >= nextSince));
 
+  // Nothing changed: leave since alone, so an update the cached answer hid is still in range next time.
   if (res.status === 304) {
-    if (state.since) {
-      state.since = nextSince;
-      state.seen = keep(state.seen);
-    }
     state.lastError = undefined;
     writeState(cfg.stateFile, state);
     return "not modified";
   }
   if (!res.ok) return fail(cfg, state, `GitHub ${res.status}`);
 
-  const lastModified = res.headers.get("last-modified");
+  const etag = res.headers.get("etag") ?? undefined;
   let threads: Thread[];
   try {
-    threads = await readAllPages(res, headers);
+    threads = await readAllPages(res, headers, cfg.githubApi);
   } catch (e) {
     return fail(cfg, state, (e as Error).message);
   }
-  state.lastModified = lastModified ?? state.lastModified;
+  state.etag = etag;
   state.lastError = undefined;
 
   // First success: start from now instead of replaying the inbox.
   if (!state.since) {
+    // Threads here were updated during this very query; leaving them unseen sends them next run.
     state.since = nextSince;
-    state.seen = keep(Object.fromEntries(threads.map((t) => [t.id, t.updated_at])));
+    state.seen = {};
     writeState(cfg.stateFile, state);
     return `baseline: ${threads.length}`;
   }
@@ -167,6 +182,11 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
       try {
         await ntfy(cfg, `${t.repository.full_name}: ${t.subject.title}`, `${t.reason} / ${t.subject.type}`, htmlUrl(t));
         sent++;
+        // Checkpoint each send: if the unit is killed mid-loop, the next run does not resend it.
+        seen[t.id] = t.updated_at;
+        state.seen = seen;
+        writeState(cfg.stateFile, state);
+        continue;
       } catch (e) {
         // Left out of seen, so the next run sends it again.
         error = (e as Error).message;
@@ -176,9 +196,9 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     seen[t.id] = t.updated_at;
   }
   if (error) {
-    // Keep since and drop If-Modified-Since so the unsent threads come back next run.
+    // Keep since and drop the ETag so the unsent threads come back next run.
     state.seen = seen;
-    state.lastModified = undefined;
+    state.etag = undefined;
     writeState(cfg.stateFile, state);
     throw new Error(`sent ${sent}, then ${error}`);
   }
@@ -194,16 +214,18 @@ function iso(ms: number): string {
 }
 
 // Follows Link rel="next" so every updated thread is seen, not just the first page.
-async function readAllPages(first: Response, headers: Record<string, string>): Promise<Thread[]> {
+async function readAllPages(first: Response, headers: Record<string, string>, api: string): Promise<Thread[]> {
   const out: Thread[] = [];
   let res = first;
   for (let page = 1; ; page++) {
     out.push(...((await res.json()) as Thread[]));
     const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
     if (!next) return out;
+    // The token goes with the request, so only follow links back to the configured API.
+    if (new URL(next).origin !== new URL(api).origin) throw new Error(`refusing next page on another host: ${new URL(next).origin}`);
     // Over 5000 updated threads in one window means something is wrong; stop rather than loop.
     if (page >= 50) throw new Error("more than 50 pages of updated notifications");
-    const { "If-Modified-Since": _, ...plain } = headers;
+    const { "If-None-Match": _, ...plain } = headers;
     res = await fetch(next, { headers: plain, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) throw new Error(`GitHub ${res.status} on page ${page + 1}`);
   }
@@ -218,7 +240,11 @@ async function fail(cfg: Config, state: State, msg: string): Promise<never> {
       state.lastError = msg;
     } catch {}
   }
-  writeState(cfg.stateFile, state);
+  try {
+    writeState(cfg.stateFile, state);
+  } catch (e) {
+    console.error(`state not saved: ${(e as Error).message}`);
+  }
   throw new Error(msg);
 }
 
@@ -232,7 +258,7 @@ export async function login(
   const post = async (path: string, body: Record<string, string>) => {
     const res = await fetch(`${web}${path}`, {
       method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "github-notifications-ntfy" },
       body: JSON.stringify(body),
       redirect: "manual",
       signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -243,6 +269,7 @@ export async function login(
 
   const code = await post("/login/device/code", { client_id: clientId, scope: "notifications" });
   if (code.error) throw new Error(`device code: ${code.error}`);
+  if (!code.device_code || !code.user_code || !code.verification_uri) throw new Error("device code: incomplete response");
   say(`Open ${code.verification_uri} and enter ${code.user_code}`);
 
   let interval = Number(code.interval) || 5;
@@ -261,7 +288,7 @@ export async function login(
       interval = Number(r.interval) || interval + 5;
       continue;
     }
-    throw new Error(`login: ${r.error}`);
+    throw new Error(`login: ${r.error}${r.error_description ? ` (${r.error_description})` : ""}`);
   }
   throw new Error("login: device code expired");
 }

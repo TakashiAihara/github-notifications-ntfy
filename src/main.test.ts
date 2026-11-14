@@ -5,13 +5,15 @@ import { join } from "node:path";
 import { htmlUrl, loadConfig, login, run } from "./main";
 
 type Sent = { title: string; body: string; click: string | null; auth: string | null };
-type GhReq = { path: string; since: string | null; page: string | null; ims: string | null; auth: string | null; ua: string | null };
+type GhReq = { path: string; since: string | null; page: string | null; inm: string | null; auth: string | null; ua: string | null };
 
 const T0 = Date.parse("2026-11-14T00:00:00Z");
 const at = (sec: number) => new Date(T0 + sec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
-const LAST_MODIFIED = "Sat, 14 Nov 2026 08:00:00 GMT";
+const ETAG = 'W/"abc"';
 
 let ghStatus = 200;
+let ghEtag: string | null = ETAG;
+let ghNextHost: string | null = null;
 let ghThreads: ReturnType<typeof thread>[] = [];
 let ghPerPage = 100;
 let ghEndless = false;
@@ -20,6 +22,7 @@ let ghReqs: GhReq[] = [];
 let deviceReplies: Record<string, unknown>[] = [];
 let deviceExpires = 900;
 let deviceCodeError: string | undefined;
+let deviceIncomplete = false;
 let deviceBodies: Record<string, string>[] = [];
 let ntfyFailOnce = 0;
 let ntfyCalls = 0;
@@ -33,17 +36,19 @@ const server = Bun.serve({
     if (url.pathname === "/notifications") {
       const since = url.searchParams.get("since");
       const page = url.searchParams.get("page");
-      ghReqs.push({ path: url.pathname, since, page, ims: req.headers.get("if-modified-since"), auth: req.headers.get("authorization"), ua: req.headers.get("user-agent") });
-      const h: Record<string, string> = { "x-poll-interval": ghPollInterval, "last-modified": LAST_MODIFIED };
+      ghReqs.push({ path: url.pathname, since, page, inm: req.headers.get("if-none-match"), auth: req.headers.get("authorization"), ua: req.headers.get("user-agent") });
+      const h: Record<string, string> = { "x-poll-interval": ghPollInterval };
+      if (ghEtag) h.etag = ghEtag;
       if (ghStatus !== 200) return new Response(null, { status: ghStatus, headers: h });
       const all = ghThreads.filter((t) => !since || t.updated_at > since);
       const n = Number(page ?? "1");
-      if (ghEndless || all.length > n * ghPerPage) h.link = `<http://127.0.0.1:${server.port}/notifications?since=${since}&page=${n + 1}>; rel="next"`;
+      if (ghEndless || all.length > n * ghPerPage) h.link = `<${ghNextHost ?? `http://127.0.0.1:${server.port}`}/notifications?since=${since}&page=${n + 1}>; rel="next"`;
       return Response.json(all.slice((n - 1) * ghPerPage, n * ghPerPage), { headers: h });
     }
     if (url.pathname === "/login/device/code") {
       deviceBodies.push(await req.json());
       if (deviceCodeError) return Response.json({ error: deviceCodeError });
+      if (deviceIncomplete) return Response.json({ interval: 5 });
       return Response.json({ device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: deviceExpires, interval: 5 });
     }
     if (url.pathname === "/login/oauth/access_token") {
@@ -88,6 +93,8 @@ function thread(id: string, reason: string, updatedSec: number, title = `t${id}`
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gnn-"));
   ghStatus = 200;
+  ghEtag = ETAG;
+  ghNextHost = null;
   ghThreads = [];
   ghPerPage = 100;
   ghEndless = false;
@@ -96,12 +103,20 @@ beforeEach(() => {
   deviceReplies = [];
   deviceExpires = 900;
   deviceCodeError = undefined;
+  deviceIncomplete = false;
   deviceBodies = [];
   ntfyFailOnce = 0;
   ntfyCalls = 0;
   sent = [];
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+test("an update landing during the first query is sent on the next run", async () => {
+  ghThreads = [thread("1", "mention", 5)];
+  expect(await poll(0)).toBe("baseline: 1");
+  expect(sent).toHaveLength(0);
+  expect(await poll(61)).toBe("sent 1");
+});
 
 test("first run starts from now and sends nothing", async () => {
   ghThreads = [thread("old", "mention", -3600)];
@@ -146,12 +161,23 @@ test("REASONS=all sends every reason", async () => {
   expect(await poll(61, c)).toBe("sent 1");
 });
 
-test("304 replays If-Modified-Since and moves since forward", async () => {
+test("304 replays the ETag and leaves since and seen alone", async () => {
   await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  await poll(61);
   ghStatus = 304;
-  expect(await poll(61)).toBe("not modified");
-  expect(ghReqs.map((r) => r.ims)).toEqual([null, LAST_MODIFIED]);
+  expect(await poll(400)).toBe("not modified");
+  expect(ghReqs.map((r) => r.inm)).toEqual([null, ETAG, ETAG]);
   expect(state().since).toBe(at(-59));
+  expect(state().seen).toEqual({ "1": at(30) });
+});
+
+test("a 200 without an ETag stops sending If-None-Match", async () => {
+  await poll(0);
+  ghEtag = null;
+  await poll(61);
+  await poll(122);
+  expect(ghReqs.map((r) => r.inm)).toEqual([null, ETAG, null]);
 });
 
 test("304 before any success does not count as a baseline", async () => {
@@ -186,7 +212,15 @@ test("an ntfy failure keeps since and resends only the unsent threads", async ()
   expect(state().since).toBe(at(-120));
   expect(await poll(122)).toBe("sent 1");
   expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "o/r: t3", "o/r: t2"]);
-  expect(ghReqs[2].ims).toBeNull();
+  expect(ghReqs[2].inm).toBeNull();
+});
+
+test("a send survives the run being killed afterwards", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
+  ntfyFailOnce = 2;
+  await expect(poll(61)).rejects.toThrow();
+  expect(state().seen).toEqual({ "1": at(30) });
 });
 
 test("reads every page, without If-Modified-Since after the first", async () => {
@@ -194,10 +228,19 @@ test("reads every page, without If-Modified-Since after the first", async () => 
   await poll(0);
   ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
   expect(await poll(61)).toBe("sent 2");
-  expect(ghReqs.slice(1).map((r) => [r.page, r.ims])).toEqual([
-    [null, LAST_MODIFIED],
-    ["2", null],
+  expect(ghReqs.slice(1).map((r) => [r.page, r.inm, r.auth])).toEqual([
+    [null, ETAG, "Bearer gh-test"],
+    ["2", null, "Bearer gh-test"],
   ]);
+});
+
+test("refuses a next-page link to another host", async () => {
+  ghPerPage = 1;
+  await poll(0);
+  ghNextHost = "http://127.0.0.2:1";
+  ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
+  await expect(poll(61)).rejects.toThrow("refusing next page on another host: http://127.0.0.2:1");
+  expect(ghReqs).toHaveLength(2);
 });
 
 test("stops after 50 pages instead of following next forever", async () => {
@@ -251,6 +294,13 @@ test("an unreadable state file starts a new baseline", async () => {
   expect(state().since).toBe(at(-120));
 });
 
+test("REASONS accepts any case of all and refuses unknown reasons", () => {
+  const base = { GITHUB_NOTIFICATIONS_TOKEN: "t", NTFY_URL: "u" };
+  expect(loadConfig({ ...base, REASONS: "All" }).reasons).toBeNull();
+  expect([...(loadConfig({ ...base, REASONS: "state_change, comment" }).reasons ?? [])]).toEqual(["state_change", "comment"]);
+  expect(() => loadConfig({ ...base, REASONS: "mention,review-requested" })).toThrow("unknown REASONS: review-requested");
+});
+
 test("empty env values fall back to defaults", () => {
   const c = loadConfig({ GITHUB_NOTIFICATIONS_TOKEN: "t", NTFY_URL: "u", REASONS: " ", STATE_FILE: "", GITHUB_API: "", NTFY_TOKEN: "" });
   expect([...(c.reasons ?? [])]).toEqual(["mention", "team_mention", "review_requested", "ci_activity"]);
@@ -296,6 +346,17 @@ test("login reports a refused device code request", async () => {
 
 test("login stops on access_denied", async () => {
   await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("login: access_denied");
+});
+
+test("login includes GitHub's error description", async () => {
+  deviceReplies = [{ error: "incorrect_device_code", error_description: "bad code" }];
+  await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("login: incorrect_device_code (bad code)");
+});
+
+test("login refuses an incomplete device code response", async () => {
+  deviceCodeError = "";
+  deviceIncomplete = true;
+  await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("device code: incomplete response");
 });
 
 test("htmlUrl maps API URLs to pages", () => {
