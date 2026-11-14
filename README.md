@@ -2,7 +2,7 @@
 
 Forwards new GitHub notifications from your inbox to an [ntfy](https://ntfy.sh) topic.
 
-It polls the REST endpoint `GET /notifications` once per run and is meant to be started by a timer every minute. It never uses GraphQL. Each request carries `If-Modified-Since`, so an unchanged inbox returns `304 Not Modified`, which GitHub does not count against the rate limit. The `X-Poll-Interval` header is honoured: a run that starts too early exits without calling GitHub.
+It polls the REST endpoint `GET /notifications` once per run and is meant to be started by a timer about once a minute. It never uses GraphQL. Each request carries `If-Modified-Since`, so an unchanged inbox returns `304 Not Modified`, which GitHub does not count against the rate limit. The `X-Poll-Interval` header is honoured: a run that starts too early exits without calling GitHub.
 
 ## Behaviour
 
@@ -10,8 +10,10 @@ It polls the REST endpoint `GET /notifications` once per run and is meant to be 
 - Later runs send one ntfy message per thread that is new or has a newer `updated_at`, if its `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit.
 - Notifications are not marked as read.
 - If an ntfy POST fails, the threads not yet sent are sent again on the next run, and the run exits non-zero.
-- If GitHub returns an error (for example an expired token), one ntfy message is sent per distinct error and the run exits non-zero.
-- Only the newest 50 unread threads are read per run.
+- If GitHub returns an error (for example an expired token), an ntfy message is sent when the error changes (not on every run while it repeats), and the run exits non-zero. If that message cannot be sent, it is tried again on the next run.
+- Every page of unread threads is read (`Link: rel="next"`), up to 50 pages of 100.
+- A missing or unreadable state file starts over with a new baseline.
+- Each HTTP request gives up after 10 seconds.
 
 ## Configuration
 
@@ -25,6 +27,8 @@ Environment variables:
 | `REASONS` | no (`all` sends every reason) | `mention,team_mention,review_requested,ci_activity` |
 | `STATE_FILE` | no | `/var/lib/github-notifications-ntfy/state.json` |
 | `GITHUB_API` | no | `https://api.github.com` |
+
+Empty values (`REASONS=`) count as unset. `login` reads `GITHUB_OAUTH_CLIENT_ID` and, optionally, `GITHUB_WEB` (default `https://github.com`).
 
 ## Token
 
@@ -41,7 +45,7 @@ The Notifications API does not accept fine-grained personal access tokens or Git
 
 ## Run with systemd
 
-Requires [Bun](https://bun.sh).
+Requires [Bun](https://bun.sh). The unit expects `/usr/local/bin/bun`; edit `ExecStart` if bun lives elsewhere (the official installer puts it in `~/.bun/bin/bun`). The unit runs as a dynamic user with a read-only system.
 
 ```bash
 git clone https://github.com/TakashiAihara/github-notifications-ntfy /opt/github-notifications-ntfy

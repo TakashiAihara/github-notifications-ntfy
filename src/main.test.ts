@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { htmlUrl, loadConfig, login, run } from "./main";
@@ -10,6 +10,9 @@ let ghStatus = 200;
 let ghBody: unknown[] = [];
 let ghPollInterval = "60";
 let ghSeenIms: (string | null)[] = [];
+let ghReqs: { url: string; auth: string | null; ua: string | null }[] = [];
+let ghPage2: unknown[] | null = null;
+let ghEndless = false;
 let deviceReplies: Record<string, unknown>[] = [];
 let deviceExpires = 900;
 let deviceCodeError: string | undefined;
@@ -25,8 +28,12 @@ const server = Bun.serve({
     const url = new URL(req.url);
     if (url.pathname === "/notifications") {
       ghSeenIms.push(req.headers.get("if-modified-since"));
-      const h = { "x-poll-interval": ghPollInterval, "last-modified": "Sat, 14 Nov 2026 08:00:00 GMT" };
+      ghReqs.push({ url: url.pathname + url.search, auth: req.headers.get("authorization"), ua: req.headers.get("user-agent") });
+      const h: Record<string, string> = { "x-poll-interval": ghPollInterval, "last-modified": "Sat, 14 Nov 2026 08:00:00 GMT" };
       if (ghStatus !== 200) return new Response(null, { status: ghStatus, headers: h });
+      const nextLink = `<http://127.0.0.1:${server.port}/notifications?per_page=100&page=2>; rel="next"`;
+      if (url.searchParams.get("page") === "2") return Response.json(ghPage2 ?? [], { headers: ghEndless ? { link: nextLink } : {} });
+      if (ghPage2) h.link = `<http://127.0.0.1:${server.port}/notifications?per_page=100&page=2>; rel="next", <http://127.0.0.1:${server.port}/notifications?per_page=100&page=2>; rel="last"`;
       return Response.json(ghBody, { headers: h });
     }
     if (url.pathname === "/login/device/code") {
@@ -74,6 +81,9 @@ beforeEach(() => {
   ghBody = [];
   ghPollInterval = "60";
   ghSeenIms = [];
+  ghReqs = [];
+  ghPage2 = null;
+  ghEndless = false;
   deviceReplies = [];
   deviceExpires = 900;
   deviceCodeError = undefined;
@@ -130,9 +140,78 @@ test("a 304 after an error re-arms the error notification", async () => {
 test("honours X-Poll-Interval before calling GitHub again", async () => {
   ghPollInterval = "120";
   await run(cfg(), 0);
-  expect(await run(cfg(), 119_000)).toBe("skip: poll interval");
+  expect(await run(cfg(), 114_000)).toBe("skip: poll interval");
   expect(ghSeenIms).toHaveLength(1);
-  expect(await run(cfg(), 120_000)).toBe("sent 0");
+  expect(await run(cfg(), 116_000)).toBe("sent 0");
+});
+
+test("a timer firing slightly early still polls", async () => {
+  await run(cfg(), 0);
+  expect(await run(cfg(), 59_000)).toBe("sent 0");
+});
+
+test("sends the token and a User-Agent, asking for 100 per page", async () => {
+  await run(cfg(), 0);
+  expect(ghReqs[0]).toEqual({ url: "/notifications?per_page=100", auth: "Bearer gh-test", ua: "github-notifications-ntfy" });
+});
+
+test("reads every page, without If-Modified-Since after the first", async () => {
+  ghBody = [thread("1", "mention", "a")];
+  ghPage2 = [thread("2", "mention", "a")];
+  expect(await run(cfg(), 0)).toBe("baseline: 2");
+  ghBody = [thread("1", "mention", "a")];
+  ghPage2 = [thread("2", "mention", "a"), thread("3", "mention", "a")];
+  expect(await run(cfg(), 61_000)).toBe("sent 1");
+  expect(sent.map((s) => s.title)).toEqual(["o/r: t3"]);
+  expect(ghSeenIms).toEqual([null, null, "Sat, 14 Nov 2026 08:00:00 GMT", null]);
+});
+
+test("stops after 50 pages instead of following next forever", async () => {
+  ghPage2 = [];
+  ghEndless = true;
+  await expect(run(cfg(), 0)).rejects.toThrow("more than 50 pages of unread notifications");
+  expect(ghReqs).toHaveLength(50);
+});
+
+test("a failed first run still baselines on the next success", async () => {
+  ghStatus = 500;
+  await expect(run(cfg(), 0)).rejects.toThrow("GitHub 500");
+  ghStatus = 200;
+  ghBody = [thread("1", "mention", "a")];
+  expect(await run(cfg(), 61_000)).toBe("baseline: 1");
+  expect(sent.map((s) => s.body)).toEqual(["GitHub 500"]);
+});
+
+test("an unreadable state file starts a new baseline", async () => {
+  writeFileSync(join(dir, "state.json"), "[]");
+  ghBody = [thread("1", "mention", "a")];
+  expect(await run(cfg(), 0)).toBe("baseline: 1");
+  expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).seen).toEqual({ "1": "a" });
+});
+
+test("an error alert that fails to send is retried next run", async () => {
+  await run(cfg(), 0);
+  ghStatus = 401;
+  ntfyFailOnce = 1;
+  await expect(run(cfg(), 61_000)).rejects.toThrow("GitHub 401");
+  await expect(run(cfg(), 122_000)).rejects.toThrow("GitHub 401");
+  expect(sent.map((s) => s.body)).toEqual(["GitHub 401"]);
+});
+
+test("empty env values fall back to defaults", () => {
+  const c = loadConfig({ GITHUB_NOTIFICATIONS_TOKEN: "t", NTFY_URL: "u", REASONS: " ", STATE_FILE: "", GITHUB_API: "", NTFY_TOKEN: "" });
+  expect([...(c.reasons ?? [])]).toEqual(["mention", "team_mention", "review_requested", "ci_activity"]);
+  expect(c.stateFile).toBe("/var/lib/github-notifications-ntfy/state.json");
+  expect(c.githubApi).toBe("https://api.github.com");
+  expect(c.ntfyToken).toBeUndefined();
+});
+
+test("without NTFY_TOKEN no Authorization header goes to ntfy", async () => {
+  const c = { ...cfg(), ntfyToken: undefined };
+  await run(c, 0);
+  ghBody = [thread("1", "mention", "a")];
+  await run(c, 61_000);
+  expect(sent[0].auth).toBeNull();
 });
 
 test("an ntfy failure keeps the unsent threads for the next run", async () => {

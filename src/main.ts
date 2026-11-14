@@ -15,6 +15,7 @@ type Thread = {
 };
 
 type State = {
+  baselined?: boolean;
   lastModified?: string;
   nextPollAt?: number;
   seen: Record<string, string>;
@@ -31,6 +32,9 @@ export type Config = {
 };
 
 const DEFAULT_REASONS = "mention,team_mention,review_requested,ci_activity";
+// Each request must finish well inside the unit's TimeoutStartSec=50 so failures reach fail().
+const TIMEOUT_MS = 10_000;
+const POLL_SLACK_MS = 5_000;
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const need = (k: string) => {
@@ -38,24 +42,35 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     if (!v) throw new Error(`${k} is not set`);
     return v;
   };
-  const reasons = (env.REASONS ?? DEFAULT_REASONS).trim();
+  const reasons = opt(env, "REASONS") ?? DEFAULT_REASONS;
   return {
     githubToken: need("GITHUB_NOTIFICATIONS_TOKEN"),
-    githubApi: (env.GITHUB_API ?? "https://api.github.com").replace(/\/$/, ""),
+    githubApi: (opt(env, "GITHUB_API") ?? "https://api.github.com").replace(/\/$/, ""),
     ntfyUrl: need("NTFY_URL"),
     ntfyToken: env.NTFY_TOKEN?.trim() || undefined,
     reasons: reasons === "all" ? null : new Set(reasons.split(",").map((s) => s.trim()).filter(Boolean)),
-    stateFile: env.STATE_FILE ?? "/var/lib/github-notifications-ntfy/state.json",
+    stateFile: opt(env, "STATE_FILE") ?? "/var/lib/github-notifications-ntfy/state.json",
   };
 }
 
+// An env file line like `REASONS=` means unset, not empty.
+function opt(env: Record<string, string | undefined>, k: string): string | undefined {
+  return env[k]?.trim() || undefined;
+}
+
+// A missing or unreadable state starts over with a fresh baseline, which sends nothing.
 function readState(path: string): State | null {
+  let s: unknown;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as State;
+    s = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw e;
+    console.error(`state ignored: ${(e as Error).message}`);
+    return null;
   }
+  const ok = !!s && typeof s === "object" && !!(s as State).seen && typeof (s as State).seen === "object";
+  if (!ok) console.error("state ignored: unexpected shape");
+  return ok ? (s as State) : null;
 }
 
 function writeState(path: string, s: State) {
@@ -79,26 +94,26 @@ async function ntfy(cfg: Config, title: string, body: string, click?: string) {
   const headers: Record<string, string> = { Title: `=?UTF-8?B?${Buffer.from(title).toString("base64")}?=` };
   if (click) headers.Click = click;
   if (cfg.ntfyToken) headers.Authorization = `Bearer ${cfg.ntfyToken}`;
-  const res = await fetch(cfg.ntfyUrl, { method: "POST", body, headers, redirect: "manual" });
+  const res = await fetch(cfg.ntfyUrl, { method: "POST", body, headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   if (!res.ok) throw new Error(`ntfy POST ${res.status}`);
 }
 
 export async function run(cfg: Config, now = Date.now()): Promise<string> {
-  const prev = readState(cfg.stateFile);
-  const state: State = prev ?? { seen: {} };
-  if (state.nextPollAt && now < state.nextPollAt) return "skip: poll interval";
+  const state: State = readState(cfg.stateFile) ?? { seen: {} };
+  // The timer fires about 60s after the previous start, a little before start + 60s; allow for that.
+  if (state.nextPollAt && now < state.nextPollAt - POLL_SLACK_MS) return "skip: poll interval";
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${cfg.githubToken}`,
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "github-notifications-ntfy",
   };
   if (state.lastModified) headers["If-Modified-Since"] = state.lastModified;
 
   let res: Response;
   try {
-    // shortcut: only the newest 50 unread threads are read; more than 50 new in one minute would drop the rest.
-    res = await fetch(`${cfg.githubApi}/notifications?per_page=50`, { headers, redirect: "manual" });
+    res = await fetch(`${cfg.githubApi}/notifications?per_page=100`, { headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   } catch (e) {
     return fail(cfg, state, `GitHub unreachable: ${(e as Error).message}`);
   }
@@ -112,12 +127,19 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   }
   if (!res.ok) return fail(cfg, state, `GitHub ${res.status}`);
 
-  const threads = (await res.json()) as Thread[];
-  state.lastModified = res.headers.get("last-modified") ?? state.lastModified;
+  const lastModified = res.headers.get("last-modified");
+  let threads: Thread[];
+  try {
+    threads = await readAllPages(res, headers);
+  } catch (e) {
+    return fail(cfg, state, (e as Error).message);
+  }
+  state.lastModified = lastModified ?? state.lastModified;
   state.lastError = undefined;
 
-  // First run: remember what is already there instead of replaying the whole inbox.
-  if (!prev) {
+  // First success: remember what is already there instead of replaying the whole inbox.
+  if (!state.baselined) {
+    state.baselined = true;
     state.seen = Object.fromEntries(threads.map((t) => [t.id, t.updated_at]));
     writeState(cfg.stateFile, state);
     return `baseline: ${threads.length}`;
@@ -151,11 +173,30 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   return `sent ${sent}`;
 }
 
+// Follows Link rel="next" so every unread thread is compared, not just the first page.
+async function readAllPages(first: Response, headers: Record<string, string>): Promise<Thread[]> {
+  const out: Thread[] = [];
+  let res = first;
+  for (let page = 1; ; page++) {
+    out.push(...((await res.json()) as Thread[]));
+    const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
+    if (!next) return out;
+    // Unread threads over 50 pages (5000) mean something is wrong; stop rather than loop.
+    if (page >= 50) throw new Error("more than 50 pages of unread notifications");
+    const { "If-Modified-Since": _, ...plain } = headers;
+    res = await fetch(next, { headers: plain, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`GitHub ${res.status} on page ${page + 1}`);
+  }
+}
+
 async function fail(cfg: Config, state: State, msg: string): Promise<never> {
-  // Notify once per distinct error so an expired token does not page every minute.
+  // Notify once per distinct error so an expired token does not page every minute;
+  // a failed notification is retried on the next run.
   if (state.lastError !== msg) {
-    state.lastError = msg;
-    await ntfy(cfg, "github-notifications-ntfy failed", msg).catch(() => {});
+    try {
+      await ntfy(cfg, "github-notifications-ntfy failed", msg);
+      state.lastError = msg;
+    } catch {}
   }
   writeState(cfg.stateFile, state);
   throw new Error(msg);
@@ -174,6 +215,7 @@ export async function login(
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body),
       redirect: "manual",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`${path} ${res.status}`);
     return (await res.json()) as Record<string, string | number>;
@@ -185,8 +227,9 @@ export async function login(
 
   let interval = Number(code.interval) || 5;
   const deadline = Date.now() + (Number(code.expires_in) || 900) * 1000;
-  while (Date.now() < deadline) {
+  for (;;) {
     await sleep(interval * 1000);
+    if (Date.now() >= deadline) break;
     const r = await post("/login/oauth/access_token", {
       client_id: clientId,
       device_code: String(code.device_code),
@@ -205,12 +248,14 @@ export async function login(
 
 if (import.meta.main) {
   try {
-    if (process.argv[2] === "login") {
-      const id = process.env.GITHUB_OAUTH_CLIENT_ID?.trim();
+    const cmd = process.argv[2];
+    if (cmd === "login") {
+      const id = opt(process.env, "GITHUB_OAUTH_CLIENT_ID");
       if (!id) throw new Error("GITHUB_OAUTH_CLIENT_ID is not set");
-      console.log(await login(id, process.env.GITHUB_WEB ?? "https://github.com"));
+      console.log(await login(id, (opt(process.env, "GITHUB_WEB") ?? "https://github.com").replace(/\/$/, "")));
       process.exit(0);
     }
+    if (cmd !== undefined) throw new Error(`unknown command: ${cmd} (only "login", or no argument to poll)`);
     console.log(await run(loadConfig(process.env)));
   } catch (e) {
     console.error((e as Error).message);

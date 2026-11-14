@@ -6,6 +6,12 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/github-notifications-ntfy.env
+# Adjust the bun path to where bun is installed (the official installer uses ~/.bun/bin/bun).
 ExecStart=/usr/local/bin/bun /opt/github-notifications-ntfy/src/main.ts
 TimeoutStartSec=50
 StateDirectory=github-notifications-ntfy
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
