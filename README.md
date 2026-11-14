@@ -6,12 +6,13 @@ It polls the REST endpoint `GET /notifications` once per run and is meant to be 
 
 ## Behaviour
 
-- The first run records the threads already in the inbox and sends nothing.
-- Later runs send one ntfy message per thread that is new or has a newer `updated_at`, if its `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit.
+- Each poll asks only for threads updated since the previous poll (`since`, reaching back two minutes so nothing is missed between polls; repeats inside that window are dropped). The rest of the inbox is never read, however many unread threads it holds.
+- The first successful run starts from that moment and sends nothing.
+- Later runs send one ntfy message per updated thread whose `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit.
 - Notifications are not marked as read.
 - If an ntfy POST fails, the threads not yet sent are sent again on the next run, and the run exits non-zero.
 - If GitHub returns an error (for example an expired token), an ntfy message is sent when the error changes (not on every run while it repeats), and the run exits non-zero. If that message cannot be sent, it is tried again on the next run.
-- Every page of unread threads is read (`Link: rel="next"`), up to 50 pages of 100.
+- Every page of updated threads is read (`Link: rel="next"`), up to 50 pages of 100.
 - A missing or unreadable state file starts over with a new baseline.
 - Each HTTP request gives up after 10 seconds.
 

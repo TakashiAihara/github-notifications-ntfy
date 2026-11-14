@@ -15,9 +15,11 @@ type Thread = {
 };
 
 type State = {
-  baselined?: boolean;
+  // Lower bound for the next query; unset until the first successful poll.
+  since?: string;
   lastModified?: string;
   nextPollAt?: number;
+  // Threads already handled inside the overlap window, keyed by id with their updated_at.
   seen: Record<string, string>;
   lastError?: string;
 };
@@ -35,6 +37,9 @@ const DEFAULT_REASONS = "mention,team_mention,review_requested,ci_activity";
 // Each request must finish well inside the unit's TimeoutStartSec=50 so failures reach fail().
 const TIMEOUT_MS = 10_000;
 const POLL_SLACK_MS = 5_000;
+// Each query reaches back this far before the previous start, so an update landing
+// while that query ran is not missed; `seen` drops the repeats.
+const OVERLAP_MS = 120_000;
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const need = (k: string) => {
@@ -113,14 +118,22 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
 
   let res: Response;
   try {
-    res = await fetch(`${cfg.githubApi}/notifications?per_page=100`, { headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const since = encodeURIComponent(state.since ?? iso(now));
+    res = await fetch(`${cfg.githubApi}/notifications?per_page=100&since=${since}`, { headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   } catch (e) {
     return fail(cfg, state, `GitHub unreachable: ${(e as Error).message}`);
   }
   const interval = Number(res.headers.get("x-poll-interval") ?? "60");
   state.nextPollAt = now + (Number.isFinite(interval) && interval > 0 ? interval : 60) * 1000;
 
+  const nextSince = iso(now - OVERLAP_MS);
+  const keep = (seen: Record<string, string>) => Object.fromEntries(Object.entries(seen).filter(([, u]) => u >= nextSince));
+
   if (res.status === 304) {
+    if (state.since) {
+      state.since = nextSince;
+      state.seen = keep(state.seen);
+    }
     state.lastError = undefined;
     writeState(cfg.stateFile, state);
     return "not modified";
@@ -137,20 +150,20 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   state.lastModified = lastModified ?? state.lastModified;
   state.lastError = undefined;
 
-  // First success: remember what is already there instead of replaying the whole inbox.
-  if (!state.baselined) {
-    state.baselined = true;
-    state.seen = Object.fromEntries(threads.map((t) => [t.id, t.updated_at]));
+  // First success: start from now instead of replaying the inbox.
+  if (!state.since) {
+    state.since = nextSince;
+    state.seen = keep(Object.fromEntries(threads.map((t) => [t.id, t.updated_at])));
     writeState(cfg.stateFile, state);
     return `baseline: ${threads.length}`;
   }
 
-  const seen: Record<string, string> = {};
+  const seen = { ...state.seen };
   let sent = 0;
   let error: string | undefined;
   for (const t of threads) {
-    const wanted = state.seen[t.id] !== t.updated_at && (!cfg.reasons || cfg.reasons.has(t.reason));
-    if (wanted) {
+    if (seen[t.id] === t.updated_at) continue;
+    if (!cfg.reasons || cfg.reasons.has(t.reason)) {
       try {
         await ntfy(cfg, `${t.repository.full_name}: ${t.subject.title}`, `${t.reason} / ${t.subject.type}`, htmlUrl(t));
         sent++;
@@ -162,18 +175,25 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     }
     seen[t.id] = t.updated_at;
   }
-  state.seen = seen;
   if (error) {
-    // Re-poll without If-Modified-Since so the unsent threads come back.
+    // Keep since and drop If-Modified-Since so the unsent threads come back next run.
+    state.seen = seen;
     state.lastModified = undefined;
     writeState(cfg.stateFile, state);
     throw new Error(`sent ${sent}, then ${error}`);
   }
+  state.since = nextSince;
+  state.seen = keep(seen);
   writeState(cfg.stateFile, state);
   return `sent ${sent}`;
 }
 
-// Follows Link rel="next" so every unread thread is compared, not just the first page.
+// GitHub wants YYYY-MM-DDTHH:MM:SSZ, without milliseconds.
+function iso(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+// Follows Link rel="next" so every updated thread is seen, not just the first page.
 async function readAllPages(first: Response, headers: Record<string, string>): Promise<Thread[]> {
   const out: Thread[] = [];
   let res = first;
@@ -181,8 +201,8 @@ async function readAllPages(first: Response, headers: Record<string, string>): P
     out.push(...((await res.json()) as Thread[]));
     const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
     if (!next) return out;
-    // Unread threads over 50 pages (5000) mean something is wrong; stop rather than loop.
-    if (page >= 50) throw new Error("more than 50 pages of unread notifications");
+    // Over 5000 updated threads in one window means something is wrong; stop rather than loop.
+    if (page >= 50) throw new Error("more than 50 pages of updated notifications");
     const { "If-Modified-Since": _, ...plain } = headers;
     res = await fetch(next, { headers: plain, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) throw new Error(`GitHub ${res.status} on page ${page + 1}`);
