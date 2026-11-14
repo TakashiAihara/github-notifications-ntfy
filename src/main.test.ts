@@ -279,6 +279,15 @@ test("a GitHub error with ntfy also down keeps the unit failing through a skippe
   await expect(poll(122)).rejects.toThrow("skip: poll interval (last error: GitHub 401)");
 });
 
+test("a baseline after a failed first run clears the failing state", async () => {
+  ghPollInterval = "120";
+  ghStatus = 500;
+  await expect(poll(0)).rejects.toThrow("GitHub 500");
+  ghStatus = 200;
+  await poll(121);
+  expect(await poll(182)).toBe("skip: poll interval");
+});
+
 test("a later success clears the failing state", async () => {
   await poll(0);
   ghStatus = 500;

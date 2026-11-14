@@ -190,6 +190,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     // Threads here were updated during this very query; leaving them unseen sends them next run.
     state.since = nextSince;
     state.seen = {};
+    state.failing = undefined;
     writeState(cfg.stateFile, state);
     return `baseline: ${threads.length}`;
   }
