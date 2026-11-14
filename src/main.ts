@@ -58,6 +58,7 @@ const POLL_SLACK_MS = 5_000;
 // Each query reaches back this far before the previous start, so an update landing
 // while that query ran is not missed; `seen` drops the repeats.
 const OVERLAP_MS = 120_000;
+const MAX_PAGES = 50;
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const need = (k: string) => {
@@ -118,13 +119,27 @@ async function ntfy(cfg: Config, title: string, body: string, click?: string) {
   if (click) headers.Click = click;
   if (cfg.ntfyToken) headers.Authorization = `Bearer ${cfg.ntfyToken}`;
   const res = await fetch(cfg.ntfyUrl, { method: "POST", body, headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`ntfy POST ${res.status}`);
+  if (!res.ok) throw new NtfyError(res.status);
+}
+
+class NtfyError extends Error {
+  constructor(readonly status: number) {
+    super(`ntfy POST ${status}`);
+  }
+  // ntfy refused this message itself; sending it again would fail the same way.
+  get permanent(): boolean {
+    return this.status >= 400 && this.status < 500 && this.status !== 429;
+  }
 }
 
 export async function run(cfg: Config, now = Date.now()): Promise<string> {
   const state: State = readState(cfg.stateFile) ?? { seen: {} };
   // The timer fires about 60s after the previous start, a little before start + 60s; allow for that.
-  if (state.nextPollAt && now < state.nextPollAt - POLL_SLACK_MS) return "skip: poll interval";
+  if (state.nextPollAt && now < state.nextPollAt - POLL_SLACK_MS) {
+    // Exit non-zero while the last poll's error stands, so the unit stays visibly failed.
+    if (state.lastError) throw new Error(`skip: poll interval (last error: ${state.lastError})`);
+    return "skip: poll interval";
+  }
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${cfg.githubToken}`,
@@ -157,8 +172,9 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
 
   const etag = res.headers.get("etag") ?? undefined;
   let threads: Thread[];
+  let truncated: boolean;
   try {
-    threads = await readAllPages(res, headers, cfg.githubApi);
+    ({ threads, truncated } = await readAllPages(res, headers, cfg.githubApi));
   } catch (e) {
     return fail(cfg, state, (e as Error).message);
   }
@@ -188,9 +204,15 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
         writeState(cfg.stateFile, state);
         continue;
       } catch (e) {
-        // Left out of seen, so the next run sends it again.
+        if (e instanceof NtfyError && e.permanent) {
+          // Dropped rather than retried forever, which would freeze since.
+          console.error(`dropped ${t.id} (${t.subject.title}): ${e.message}`);
+          seen[t.id] = t.updated_at;
+          continue;
+        }
+        // ntfy is down or slow: stop here; this and later threads are sent next run.
         error = (e as Error).message;
-        continue;
+        break;
       }
     }
     seen[t.id] = t.updated_at;
@@ -200,6 +222,10 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     state.seen = seen;
     writeState(cfg.stateFile, state);
     throw new Error(`sent ${sent}, then ${error}`);
+  }
+  if (truncated) {
+    // Best effort: the newest updates went out; tell the user the older ones did not.
+    await ntfy(cfg, "github-notifications-ntfy skipped updates", `more than ${MAX_PAGES * 100} threads were updated since the last poll; only the newest were sent`).catch(() => {});
   }
   // The ETag is saved only now: a run killed mid-loop must not let a 304 hide the unsent threads.
   state.etag = etag;
@@ -215,17 +241,18 @@ function iso(ms: number): string {
 }
 
 // Follows Link rel="next" so every updated thread is seen, not just the first page.
-async function readAllPages(first: Response, headers: Record<string, string>, api: string): Promise<Thread[]> {
+// Pages come newest first. Past MAX_PAGES the older rest is left out (truncated), so a long
+// outage cannot make every run fetch 50 pages, fail, and start over.
+async function readAllPages(first: Response, headers: Record<string, string>, api: string): Promise<{ threads: Thread[]; truncated: boolean }> {
   const out: Thread[] = [];
   let res = first;
   for (let page = 1; ; page++) {
     out.push(...((await res.json()) as Thread[]));
     const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
-    if (!next) return out;
+    if (!next) return { threads: out, truncated: false };
     // The token goes with the request, so only follow links back to the configured API.
     if (new URL(next).origin !== new URL(api).origin) throw new Error(`refusing next page on another host: ${new URL(next).origin}`);
-    // Over 5000 updated threads in one window means something is wrong; stop rather than loop.
-    if (page >= 50) throw new Error("more than 50 pages of updated notifications");
+    if (page >= MAX_PAGES) return { threads: out, truncated: true };
     const { "If-None-Match": _, ...plain } = headers;
     res = await fetch(next, { headers: plain, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) throw new Error(`GitHub ${res.status} on page ${page + 1}`);

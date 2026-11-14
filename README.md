@@ -10,9 +10,10 @@ It polls the REST endpoint `GET /notifications` once per run and is meant to be 
 - The first successful run sends nothing; the next run picks up updates from two minutes before it.
 - Later runs send one ntfy message per updated thread whose `reason` is in `REASONS`. The message title is `<owner/repo>: <subject title>`, the body is `<reason> / <subject type>`, and tapping it opens the pull request, issue or commit. State is saved after each message, so a run killed mid-way does not send the same thread twice.
 - Notifications are not marked as read.
-- If an ntfy POST fails, the threads not yet sent are sent again on the next run, and the run exits non-zero.
+- If ntfy is down (connection error, timeout, 5xx, 429, or a redirect), the run stops there, exits non-zero, and the next run sends from that thread on. A message ntfy refuses outright (any other 4xx) is logged and dropped instead of retried forever.
 - If GitHub returns an error (for example an expired token), an ntfy message is sent when the error changes (not on every run while it repeats), and the run exits non-zero. If that message cannot be sent, it is tried again on the next run.
-- Every page of updated threads is read (`Link: rel="next"`), up to 50 pages of 100.
+- Every page of updated threads is read (`Link: rel="next"`), up to 50 pages of 100. Past that (for example after a long outage) the newest are sent, the older ones are skipped, and one ntfy message says so.
+- While the last poll's error stands, a run that waits out `X-Poll-Interval` also exits non-zero, so the unit stays in `systemctl --failed`.
 - A missing or unreadable state file starts over with a new baseline.
 - Each HTTP request gives up after 10 seconds.
 

@@ -25,6 +25,8 @@ let deviceCodeError: string | undefined;
 let deviceIncomplete = false;
 let deviceBodies: Record<string, string>[] = [];
 let ntfyFailOnce = 0;
+let ntfyFailStatus = 500;
+let ghPage2Status = 200;
 let ntfyCalls = 0;
 let sent: Sent[] = [];
 
@@ -42,6 +44,7 @@ const server = Bun.serve({
       if (ghStatus !== 200) return new Response(null, { status: ghStatus, headers: h });
       const all = ghThreads.filter((t) => !since || t.updated_at > since);
       const n = Number(page ?? "1");
+      if (n > 1 && ghPage2Status !== 200) return new Response(null, { status: ghPage2Status });
       if (ghEndless || all.length > n * ghPerPage) h.link = `<${ghNextHost ?? `http://127.0.0.1:${server.port}`}/notifications?since=${since}&page=${n + 1}>; rel="next"`;
       return Response.json(all.slice((n - 1) * ghPerPage, n * ghPerPage), { headers: h });
     }
@@ -56,7 +59,7 @@ const server = Bun.serve({
       return Response.json(deviceReplies.shift() ?? { error: "access_denied" });
     }
     if (url.pathname === "/topic") {
-      if (++ntfyCalls === ntfyFailOnce) return new Response("no", { status: 500 });
+      if (++ntfyCalls === ntfyFailOnce) return new Response("no", { status: ntfyFailStatus });
       const raw = req.headers.get("title") ?? "";
       const title = Buffer.from(raw.replace(/^=\?UTF-8\?B\?|\?=$/g, ""), "base64").toString();
       sent.push({ title, body: await req.text(), click: req.headers.get("click"), auth: req.headers.get("authorization") });
@@ -106,6 +109,8 @@ beforeEach(() => {
   deviceIncomplete = false;
   deviceBodies = [];
   ntfyFailOnce = 0;
+  ntfyFailStatus = 500;
+  ghPage2Status = 200;
   ntfyCalls = 0;
   sent = [];
 });
@@ -206,15 +211,46 @@ test("sends the token and a User-Agent", async () => {
   expect(ghReqs[0]).toMatchObject({ auth: "Bearer gh-test", ua: "github-notifications-ntfy" });
 });
 
-test("an ntfy failure keeps since and resends only the unsent threads", async () => {
+test("an ntfy outage stops the run, keeps since, and resends from there", async () => {
   await poll(0);
   ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31), thread("3", "mention", 32)];
   ntfyFailOnce = 2;
-  await expect(poll(61)).rejects.toThrow("sent 2, then ntfy POST 500");
+  await expect(poll(61)).rejects.toThrow("sent 1, then ntfy POST 500");
+  expect(ntfyCalls).toBe(2);
   expect(state().since).toBe(at(-120));
-  expect(await poll(122)).toBe("sent 1");
-  expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "o/r: t3", "o/r: t2"]);
+  expect(await poll(122)).toBe("sent 2");
+  expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "o/r: t2", "o/r: t3"]);
   expect(ghReqs[2].inm).toBeNull();
+});
+
+test("a message ntfy refuses (4xx) is dropped instead of retried forever", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
+  ntfyFailOnce = 1;
+  ntfyFailStatus = 413;
+  expect(await poll(61)).toBe("sent 1");
+  expect(sent.map((s) => s.title)).toEqual(["o/r: t2"]);
+  expect(state().since).toBe(at(-59));
+  // Still inside the overlap window: the dropped thread is not tried again.
+  expect(await poll(122)).toBe("sent 0");
+  expect(ntfyCalls).toBe(2);
+});
+
+test("an ntfy redirect counts as an outage, not a refusal", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  ntfyFailOnce = 1;
+  ntfyFailStatus = 301;
+  await expect(poll(61)).rejects.toThrow("ntfy POST 301");
+});
+
+test("ntfy 429 counts as an outage, not a refusal", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  ntfyFailOnce = 1;
+  ntfyFailStatus = 429;
+  await expect(poll(61)).rejects.toThrow("ntfy POST 429");
+  expect(await poll(122)).toBe("sent 1");
 });
 
 test("a send survives the run being killed afterwards, and the ETag waits for the end", async () => {
@@ -274,10 +310,48 @@ test("refuses a next-page link to another host", async () => {
   expect(ghReqs).toHaveLength(2);
 });
 
-test("stops after 50 pages instead of following next forever", async () => {
+test("past 50 pages sends the newest, moves on, and says so", async () => {
+  await poll(0);
   ghEndless = true;
-  await expect(poll(0)).rejects.toThrow("more than 50 pages of updated notifications");
-  expect(ghReqs).toHaveLength(50);
+  ghThreads = [thread("1", "mention", 30)];
+  expect(await poll(61)).toBe("sent 1");
+  expect(ghReqs).toHaveLength(51);
+  expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "github-notifications-ntfy skipped updates"]);
+  expect(state().since).toBe(at(-59));
+});
+
+test("an error on a later page fails the run", async () => {
+  ghPerPage = 1;
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
+  ghPage2Status = 502;
+  await expect(poll(61)).rejects.toThrow("GitHub 502 on page 2");
+  expect(sent.map((s) => s.body)).toEqual(["GitHub 502 on page 2"]);
+});
+
+test("GitHub unreachable fails the run and alerts", async () => {
+  const c = { ...cfg(), githubApi: "http://127.0.0.1:1" };
+  await expect(run(c, T0)).rejects.toThrow("GitHub unreachable");
+  expect(sent).toHaveLength(1);
+  expect(sent[0].body).toStartWith("GitHub unreachable");
+});
+
+test("a skipped run after an error still fails", async () => {
+  await poll(0);
+  ghStatus = 401;
+  ghPollInterval = "120";
+  await expect(poll(61)).rejects.toThrow("GitHub 401");
+  await expect(poll(122)).rejects.toThrow("skip: poll interval (last error: GitHub 401)");
+  expect(ghReqs).toHaveLength(2);
+});
+
+test("a bad X-Poll-Interval falls back to 60 seconds", async () => {
+  for (const v of ["nope", "0"]) {
+    rmSync(join(dir, "state.json"), { force: true });
+    ghPollInterval = v;
+    await poll(0);
+    expect(state().nextPollAt).toBe(T0 + 60_000);
+  }
 });
 
 test("a GitHub error notifies once per distinct error and fails", async () => {
@@ -380,6 +454,10 @@ test("login stops on access_denied", async () => {
   await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("login: access_denied");
 });
 
+test("login fails on an HTTP error from GitHub", async () => {
+  await expect(login("cid", `http://127.0.0.1:${server.port}/nope`, async () => {}, () => {})).rejects.toThrow("/login/device/code 404");
+});
+
 test("login includes GitHub's error description", async () => {
   deviceReplies = [{ error: "incorrect_device_code", error_description: "bad code" }];
   await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("login: incorrect_device_code (bad code)");
@@ -395,6 +473,7 @@ test("htmlUrl maps API URLs to pages", () => {
   const t = (url: string | null, type = "Issue") => ({ ...thread("1", "mention", 0), subject: { title: "x", url, type } });
   expect(htmlUrl(t("https://api.github.com/repos/o/r/issues/5"))).toBe("https://github.com/o/r/issues/5");
   expect(htmlUrl(t("https://api.github.com/repos/o/r/commits/abc"))).toBe("https://github.com/o/r/commit/abc");
+  expect(htmlUrl(t("https://api.github.com/repos/o/r/releases/123"))).toBe("https://github.com/o/r/releases");
   expect(htmlUrl(t(null, "CheckSuite"))).toBe("https://github.com/o/r/actions");
   expect(htmlUrl(t(null, "Discussion"))).toBe("https://github.com/notifications");
 });
