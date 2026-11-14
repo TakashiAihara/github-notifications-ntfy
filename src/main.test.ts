@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { htmlUrl, loadConfig, login, run } from "./main";
 
 type Sent = { title: string; body: string; click: string | null; auth: string | null };
-type GhReq = { path: string; since: string | null; page: string | null; inm: string | null; auth: string | null; ua: string | null };
+type GhReq = { path: string; since: string | null; page: string | null; perPage: string | null; inm: string | null; auth: string | null; ua: string | null };
 
 const T0 = Date.parse("2026-11-14T00:00:00Z");
 const at = (sec: number) => new Date(T0 + sec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -38,7 +38,7 @@ const server = Bun.serve({
     if (url.pathname === "/notifications") {
       const since = url.searchParams.get("since");
       const page = url.searchParams.get("page");
-      ghReqs.push({ path: url.pathname, since, page, inm: req.headers.get("if-none-match"), auth: req.headers.get("authorization"), ua: req.headers.get("user-agent") });
+      ghReqs.push({ path: url.pathname, since, page, perPage: url.searchParams.get("per_page"), inm: req.headers.get("if-none-match"), auth: req.headers.get("authorization"), ua: req.headers.get("user-agent") });
       const h: Record<string, string> = { "x-poll-interval": ghPollInterval };
       if (ghEtag) h.etag = ghEtag;
       if (ghStatus !== 200) return new Response(null, { status: ghStatus, headers: h });
@@ -208,7 +208,7 @@ test("a timer firing slightly early still polls", async () => {
 
 test("sends the token and a User-Agent", async () => {
   await poll(0);
-  expect(ghReqs[0]).toMatchObject({ auth: "Bearer gh-test", ua: "github-notifications-ntfy" });
+  expect(ghReqs[0]).toMatchObject({ auth: "Bearer gh-test", ua: "github-notifications-ntfy", perPage: "50" });
 });
 
 test("an ntfy outage stops the run, keeps since, and resends from there", async () => {
@@ -380,14 +380,29 @@ test("refuses a next-page link to another host", async () => {
   expect(ghReqs).toHaveLength(2);
 });
 
-test("past 50 pages sends the newest, moves on, and says so", async () => {
+test("past 100 pages sends the newest, moves on, and says so", async () => {
   await poll(0);
   ghEndless = true;
   ghThreads = [thread("1", "mention", 30)];
   expect(await poll(61)).toBe("sent 1");
-  expect(ghReqs).toHaveLength(51);
+  expect(ghReqs).toHaveLength(101);
   expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "github-notifications-ntfy skipped updates"]);
+  expect(sent[1].body).toBe("too many threads were updated since the last poll to read in one run; only the newest 1 were sent");
   expect(state().since).toBe(at(-59));
+});
+
+test("paging stops when the time budget runs out", async () => {
+  const c = { ...cfg(), pagingBudgetMs: 0 };
+  await poll(0, c);
+  ghPerPage = 1;
+  ghThreads = [thread("1", "mention", 30), thread("2", "mention", 31)];
+  expect(await poll(61, c)).toBe("sent 1");
+  expect(ghReqs).toHaveLength(2);
+  expect(sent.map((s) => s.title)).toEqual(["o/r: t1", "github-notifications-ntfy skipped updates"]);
+});
+
+test("the default paging budget is 25 seconds", () => {
+  expect(cfg().pagingBudgetMs).toBe(25_000);
 });
 
 test("an error on a later page fails the run", async () => {

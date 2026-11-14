@@ -35,6 +35,7 @@ export type Config = {
   ntfyToken?: string;
   reasons: Set<string> | null;
   stateFile: string;
+  pagingBudgetMs: number;
 };
 
 const DEFAULT_REASONS = "mention,team_mention,review_requested,ci_activity";
@@ -61,7 +62,11 @@ const POLL_SLACK_MS = 5_000;
 // Each query reaches back this far before the previous start, so an update landing
 // while that query ran is not missed; `seen` drops the repeats.
 const OVERLAP_MS = 120_000;
-const MAX_PAGES = 50;
+// GitHub caps per_page at 50 for this endpoint (it answers 50 for per_page=100).
+const PER_PAGE = 50;
+const MAX_PAGES = 100;
+// Paging stops after this long, so the run ends well inside the unit's TimeoutStartSec=50.
+const PAGING_BUDGET_MS = 25_000;
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const need = (k: string) => {
@@ -77,6 +82,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     ntfyToken: env.NTFY_TOKEN?.trim() || undefined,
     reasons: parseReasons(reasons),
     stateFile: opt(env, "STATE_FILE") ?? "/var/lib/github-notifications-ntfy/state.json",
+    pagingBudgetMs: PAGING_BUDGET_MS,
   };
 }
 
@@ -156,7 +162,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   let res: Response;
   try {
     const since = encodeURIComponent(state.since ?? iso(now));
-    res = await fetch(`${cfg.githubApi}/notifications?per_page=100&since=${since}`, { headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+    res = await fetch(`${cfg.githubApi}/notifications?per_page=${PER_PAGE}&since=${since}`, { headers, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   } catch (e) {
     return fail(cfg, state, `GitHub unreachable: ${(e as Error).message}`);
   }
@@ -179,7 +185,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   let threads: Thread[];
   let truncated: boolean;
   try {
-    ({ threads, truncated } = await readAllPages(res, headers, cfg.githubApi));
+    ({ threads, truncated } = await readAllPages(res, headers, cfg.githubApi, Date.now() + cfg.pagingBudgetMs));
   } catch (e) {
     return fail(cfg, state, (e as Error).message);
   }
@@ -235,7 +241,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   }
   if (truncated) {
     // Best effort: the newest updates went out; tell the user the older ones did not.
-    await ntfy(cfg, "github-notifications-ntfy skipped updates", `more than ${MAX_PAGES * 100} threads were updated since the last poll; only the newest were sent`).catch(() => {});
+    await ntfy(cfg, "github-notifications-ntfy skipped updates", `too many threads were updated since the last poll to read in one run; only the newest ${threads.length} were sent`).catch(() => {});
   }
   // The ETag is saved only now: a run killed mid-loop must not let a 304 hide the unsent threads.
   state.etag = etag;
@@ -252,9 +258,9 @@ function iso(ms: number): string {
 }
 
 // Follows Link rel="next" so every updated thread is seen, not just the first page.
-// Pages come newest first. Past MAX_PAGES the older rest is left out (truncated), so a long
-// outage cannot make every run fetch 50 pages, fail, and start over.
-async function readAllPages(first: Response, headers: Record<string, string>, api: string): Promise<{ threads: Thread[]; truncated: boolean }> {
+// Pages come newest first. Past MAX_PAGES or the time budget the older rest is left out
+// (truncated), so a long outage cannot make every run fetch, time out, and start over.
+async function readAllPages(first: Response, headers: Record<string, string>, api: string, deadline: number): Promise<{ threads: Thread[]; truncated: boolean }> {
   const out: Thread[] = [];
   let res = first;
   for (let page = 1; ; page++) {
@@ -263,7 +269,7 @@ async function readAllPages(first: Response, headers: Record<string, string>, ap
     if (!next) return { threads: out, truncated: false };
     // The token goes with the request, so only follow links back to the configured API.
     if (new URL(next).origin !== new URL(api).origin) throw new Error(`refusing next page on another host: ${new URL(next).origin}`);
-    if (page >= MAX_PAGES) return { threads: out, truncated: true };
+    if (page >= MAX_PAGES || Date.now() >= deadline) return { threads: out, truncated: true };
     const { "If-None-Match": _, ...plain } = headers;
     res = await fetch(next, { headers: plain, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) throw new Error(`GitHub ${res.status} on page ${page + 1}`);

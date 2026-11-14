@@ -14,7 +14,7 @@ It polls the REST endpoint `GET /notifications` once per run and is meant to be 
 - Only unread threads are seen, as on github.com's notification list: a thread read on github.com before the next poll is not sent.
 - If the state file cannot be written, the run stops before sending anything.
 - If GitHub returns an error (for example an expired token), an ntfy message is sent when the error changes (not on every run while it repeats), and the run exits non-zero. If that message cannot be sent, it is tried again on the next run.
-- Every page of updated threads is read (`Link: rel="next"`), up to 50 pages of 100. Past that (for example after a long outage) the newest are sent, the older ones are skipped, and one ntfy message says so.
+- Every page of updated threads is read (`Link: rel="next"`), up to 100 pages of 50 (the endpoint's page size limit) and 25 seconds. Past that (for example after a long outage) the newest are sent, the older ones are skipped, and one ntfy message says so.
 - While the last poll's error stands (GitHub or ntfy), a run that waits out `X-Poll-Interval` also exits non-zero, so the unit stays in `systemctl --failed`.
 - A missing or unreadable state file starts over with a new baseline.
 - Each HTTP request gives up after 10 seconds.
