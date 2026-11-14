@@ -38,7 +38,7 @@ The Notifications API does not accept fine-grained personal access tokens or Git
 - An OAuth app token (recommended). Register an OAuth app under Settings → Developer settings → OAuth Apps, tick "Enable Device Flow", and run the device flow once. Only the client ID is needed; there is no client secret and no callback server. The token is printed to stdout and the prompt to stderr, so redirect stdout straight into your secret store:
 
   ```bash
-  GITHUB_OAUTH_CLIENT_ID=<client id> bun src/main.ts login > token.txt
+  (umask 077; GITHUB_OAUTH_CLIENT_ID=<client id> bun src/main.ts login > token.txt)
   ```
 
   The token is requested with the `notifications` scope only and can be revoked from Settings → Applications → Authorized OAuth Apps.
@@ -46,7 +46,11 @@ The Notifications API does not accept fine-grained personal access tokens or Git
 
 ## Run with systemd
 
-Requires [Bun](https://bun.sh). The unit expects `/usr/local/bin/bun`; edit `ExecStart` if bun lives elsewhere (the official installer puts it in `~/.bun/bin/bun`). The unit runs as a dynamic user with a read-only system.
+Requires [Bun](https://bun.sh) at `/usr/local/bin/bun`. The unit runs as a dynamic user with `ProtectHome=yes`, so a bun under a home directory (the official installer's default `~/.bun/bin/bun`) cannot be started; install it system-wide instead:
+
+```bash
+curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
+```
 
 ```bash
 git clone https://github.com/TakashiAihara/github-notifications-ntfy /opt/github-notifications-ntfy
