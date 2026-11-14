@@ -1,0 +1,11 @@
+[Unit]
+Description=Forward new GitHub notifications to ntfy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/github-notifications-ntfy.env
+ExecStart=/usr/local/bin/bun /opt/github-notifications-ntfy/src/main.ts
+TimeoutStartSec=50
+StateDirectory=github-notifications-ntfy
