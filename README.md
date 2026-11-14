@@ -26,7 +26,18 @@ Environment variables:
 | `STATE_FILE` | no | `/var/lib/github-notifications-ntfy/state.json` |
 | `GITHUB_API` | no | `https://api.github.com` |
 
-The Notifications API does not accept fine-grained personal access tokens or GitHub App tokens. Use a classic personal access token with the `notifications` scope.
+## Token
+
+The Notifications API does not accept fine-grained personal access tokens or GitHub App tokens. Two kinds work:
+
+- An OAuth app token (recommended). Register an OAuth app under Settings → Developer settings → OAuth Apps, tick "Enable Device Flow", and run the device flow once. Only the client ID is needed; there is no client secret and no callback server. The token is printed to stdout and the prompt to stderr, so redirect stdout straight into your secret store:
+
+  ```bash
+  GITHUB_OAUTH_CLIENT_ID=<client id> bun src/main.ts login > token.txt
+  ```
+
+  The token is requested with the `notifications` scope only and can be revoked from Settings → Applications → Authorized OAuth Apps.
+- A classic personal access token with the `notifications` scope.
 
 ## Run with systemd
 

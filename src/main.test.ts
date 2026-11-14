@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { htmlUrl, loadConfig, run } from "./main";
+import { htmlUrl, loadConfig, login, run } from "./main";
 
 type Sent = { title: string; body: string; click: string | null; auth: string | null };
 
@@ -10,6 +10,10 @@ let ghStatus = 200;
 let ghBody: unknown[] = [];
 let ghPollInterval = "60";
 let ghSeenIms: (string | null)[] = [];
+let deviceReplies: Record<string, unknown>[] = [];
+let deviceExpires = 900;
+let deviceCodeError: string | undefined;
+let deviceBodies: Record<string, string>[] = [];
 let ntfyFailOnce = 0;
 let ntfyCalls = 0;
 let sent: Sent[] = [];
@@ -24,6 +28,15 @@ const server = Bun.serve({
       const h = { "x-poll-interval": ghPollInterval, "last-modified": "Sat, 14 Nov 2026 08:00:00 GMT" };
       if (ghStatus !== 200) return new Response(null, { status: ghStatus, headers: h });
       return Response.json(ghBody, { headers: h });
+    }
+    if (url.pathname === "/login/device/code") {
+      deviceBodies.push(await req.json());
+      if (deviceCodeError) return Response.json({ error: deviceCodeError });
+      return Response.json({ device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: deviceExpires, interval: 5 });
+    }
+    if (url.pathname === "/login/oauth/access_token") {
+      deviceBodies.push(await req.json());
+      return Response.json(deviceReplies.shift() ?? { error: "access_denied" });
     }
     if (url.pathname === "/topic") {
       if (++ntfyCalls === ntfyFailOnce) return new Response("no", { status: 500 });
@@ -61,6 +74,10 @@ beforeEach(() => {
   ghBody = [];
   ghPollInterval = "60";
   ghSeenIms = [];
+  deviceReplies = [];
+  deviceExpires = 900;
+  deviceCodeError = undefined;
+  deviceBodies = [];
   ntfyFailOnce = 0;
   ntfyCalls = 0;
   sent = [];
@@ -135,6 +152,33 @@ test("a GitHub error notifies once per distinct error and fails", async () => {
   await expect(run(cfg(), 122_000)).rejects.toThrow("GitHub 401");
   expect(sent.map((s) => s.body)).toEqual(["GitHub 401"]);
   expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).lastError).toBe("GitHub 401");
+});
+
+test("login polls through pending and slow_down and returns the token", async () => {
+  deviceReplies = [{ error: "authorization_pending" }, { error: "slow_down", interval: 10 }, { access_token: "gho_x" }];
+  const waits: number[] = [];
+  const said: string[] = [];
+  const tok = await login("cid", `http://127.0.0.1:${server.port}`, async (ms) => void waits.push(ms), (s) => void said.push(s));
+  expect(tok).toBe("gho_x");
+  expect(waits).toEqual([5000, 5000, 10000]);
+  expect(said).toEqual(["Open https://github.com/login/device and enter ABCD-1234"]);
+  expect(deviceBodies[0]).toEqual({ client_id: "cid", scope: "notifications" });
+  expect(deviceBodies[1]).toEqual({ client_id: "cid", device_code: "dc", grant_type: "urn:ietf:params:oauth:grant-type:device_code" });
+});
+
+test("login gives up when the device code expires", async () => {
+  deviceExpires = 0.001;
+  deviceReplies = [{ error: "authorization_pending" }];
+  await expect(login("cid", `http://127.0.0.1:${server.port}`, () => Bun.sleep(5), () => {})).rejects.toThrow("login: device code expired");
+});
+
+test("login reports a refused device code request", async () => {
+  deviceCodeError = "device_flow_disabled";
+  await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("device code: device_flow_disabled");
+});
+
+test("login stops on access_denied", async () => {
+  await expect(login("cid", `http://127.0.0.1:${server.port}`, async () => {}, () => {})).rejects.toThrow("login: access_denied");
 });
 
 test("missing token is refused", () => {

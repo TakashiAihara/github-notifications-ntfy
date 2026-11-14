@@ -161,8 +161,56 @@ async function fail(cfg: Config, state: State, msg: string): Promise<never> {
   throw new Error(msg);
 }
 
+// OAuth device flow (no client secret, no callback server). The token goes to stdout only.
+export async function login(
+  clientId: string,
+  web = "https://github.com",
+  sleep = (ms: number) => Bun.sleep(ms),
+  say = (s: string) => console.error(s),
+): Promise<string> {
+  const post = async (path: string, body: Record<string, string>) => {
+    const res = await fetch(`${web}${path}`, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      redirect: "manual",
+    });
+    if (!res.ok) throw new Error(`${path} ${res.status}`);
+    return (await res.json()) as Record<string, string | number>;
+  };
+
+  const code = await post("/login/device/code", { client_id: clientId, scope: "notifications" });
+  if (code.error) throw new Error(`device code: ${code.error}`);
+  say(`Open ${code.verification_uri} and enter ${code.user_code}`);
+
+  let interval = Number(code.interval) || 5;
+  const deadline = Date.now() + (Number(code.expires_in) || 900) * 1000;
+  while (Date.now() < deadline) {
+    await sleep(interval * 1000);
+    const r = await post("/login/oauth/access_token", {
+      client_id: clientId,
+      device_code: String(code.device_code),
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    });
+    if (r.access_token) return String(r.access_token);
+    if (r.error === "authorization_pending") continue;
+    if (r.error === "slow_down") {
+      interval = Number(r.interval) || interval + 5;
+      continue;
+    }
+    throw new Error(`login: ${r.error}`);
+  }
+  throw new Error("login: device code expired");
+}
+
 if (import.meta.main) {
   try {
+    if (process.argv[2] === "login") {
+      const id = process.env.GITHUB_OAUTH_CLIENT_ID?.trim();
+      if (!id) throw new Error("GITHUB_OAUTH_CLIENT_ID is not set");
+      console.log(await login(id, process.env.GITHUB_WEB ?? "https://github.com"));
+      process.exit(0);
+    }
     console.log(await run(loadConfig(process.env)));
   } catch (e) {
     console.error((e as Error).message);
