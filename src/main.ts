@@ -22,7 +22,10 @@ type State = {
   nextPollAt?: number;
   // Threads already handled inside the overlap window, keyed by id with their updated_at.
   seen: Record<string, string>;
+  // Last error already announced on ntfy, so a repeating error is announced once.
   lastError?: string;
+  // Set while the last poll ended in an error; a run skipped by X-Poll-Interval then fails too.
+  failing?: string;
 };
 
 export type Config = {
@@ -126,9 +129,10 @@ class NtfyError extends Error {
   constructor(readonly status: number) {
     super(`ntfy POST ${status}`);
   }
-  // ntfy refused this message itself; sending it again would fail the same way.
+  // Only errors about the message itself (malformed, too large, headers too long). Auth and
+  // routing errors (401/403/404) hit every message, so they count as an outage.
   get permanent(): boolean {
-    return this.status >= 400 && this.status < 500 && this.status !== 429;
+    return [400, 413, 414, 431].includes(this.status);
   }
 }
 
@@ -137,7 +141,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   // The timer fires about 60s after the previous start, a little before start + 60s; allow for that.
   if (state.nextPollAt && now < state.nextPollAt - POLL_SLACK_MS) {
     // Exit non-zero while the last poll's error stands, so the unit stays visibly failed.
-    if (state.lastError) throw new Error(`skip: poll interval (last error: ${state.lastError})`);
+    if (state.failing) throw new Error(`skip: poll interval (last error: ${state.failing})`);
     return "skip: poll interval";
   }
 
@@ -165,6 +169,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   // Nothing changed: leave since alone, so an update the cached answer hid is still in range next time.
   if (res.status === 304) {
     state.lastError = undefined;
+    state.failing = undefined;
     writeState(cfg.stateFile, state);
     return "not modified";
   }
@@ -189,6 +194,9 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     return `baseline: ${threads.length}`;
   }
 
+  // Fail before sending anything if the state cannot be saved; otherwise every run resends.
+  writeState(cfg.stateFile, state);
+
   const seen = { ...state.seen };
   let sent = 0;
   let error: string | undefined;
@@ -197,12 +205,6 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
     if (!cfg.reasons || cfg.reasons.has(t.reason)) {
       try {
         await ntfy(cfg, `${t.repository.full_name}: ${t.subject.title}`, `${t.reason} / ${t.subject.type}`, htmlUrl(t));
-        sent++;
-        // Checkpoint each send: if the unit is killed mid-loop, the next run does not resend it.
-        seen[t.id] = t.updated_at;
-        state.seen = seen;
-        writeState(cfg.stateFile, state);
-        continue;
       } catch (e) {
         if (e instanceof NtfyError && e.permanent) {
           // Dropped rather than retried forever, which would freeze since.
@@ -214,12 +216,19 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
         error = (e as Error).message;
         break;
       }
+      sent++;
+      // Checkpoint each send: if the unit is killed mid-loop, the next run does not resend it.
+      seen[t.id] = t.updated_at;
+      state.seen = seen;
+      writeState(cfg.stateFile, state);
+      continue;
     }
     seen[t.id] = t.updated_at;
   }
   if (error) {
     // Keep since and the old ETag; the unsent threads come back next run.
     state.seen = seen;
+    state.failing = error;
     writeState(cfg.stateFile, state);
     throw new Error(`sent ${sent}, then ${error}`);
   }
@@ -229,6 +238,7 @@ export async function run(cfg: Config, now = Date.now()): Promise<string> {
   }
   // The ETag is saved only now: a run killed mid-loop must not let a 304 hide the unsent threads.
   state.etag = etag;
+  state.failing = undefined;
   state.since = nextSince;
   state.seen = keep(seen);
   writeState(cfg.stateFile, state);
@@ -262,6 +272,7 @@ async function readAllPages(first: Response, headers: Record<string, string>, ap
 async function fail(cfg: Config, state: State, msg: string): Promise<never> {
   // Notify once per distinct error so an expired token does not page every minute;
   // a failed notification is retried on the next run.
+  state.failing = msg;
   if (state.lastError !== msg) {
     try {
       await ntfy(cfg, "github-notifications-ntfy failed", msg);

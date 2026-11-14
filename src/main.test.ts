@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { htmlUrl, loadConfig, login, run } from "./main";
@@ -236,12 +236,73 @@ test("a message ntfy refuses (4xx) is dropped instead of retried forever", async
   expect(ntfyCalls).toBe(2);
 });
 
-test("an ntfy redirect counts as an outage, not a refusal", async () => {
+test("ntfy redirects and auth or routing errors count as an outage, not a refusal", async () => {
+  for (const status of [301, 401, 403, 404]) {
+    rmSync(join(dir, "state.json"), { force: true });
+    await poll(0);
+    ghThreads = [thread("1", "mention", 30)];
+    ntfyCalls = 0;
+    ntfyFailOnce = 1;
+    ntfyFailStatus = status;
+    await expect(poll(61)).rejects.toThrow(`ntfy POST ${status}`);
+    expect(state().seen).toEqual({});
+  }
+});
+
+test("each message-level refusal (400/413/414/431) is dropped", async () => {
+  for (const status of [400, 413, 414, 431]) {
+    rmSync(join(dir, "state.json"), { force: true });
+    await poll(0);
+    ghThreads = [thread("1", "mention", 30)];
+    ntfyCalls = 0;
+    ntfyFailOnce = 1;
+    ntfyFailStatus = status;
+    expect(await poll(61)).toBe("sent 0");
+  }
+});
+
+test("an ntfy outage keeps the unit failing through a skipped run", async () => {
   await poll(0);
+  ghPollInterval = "120";
   ghThreads = [thread("1", "mention", 30)];
   ntfyFailOnce = 1;
-  ntfyFailStatus = 301;
-  await expect(poll(61)).rejects.toThrow("ntfy POST 301");
+  await expect(poll(61)).rejects.toThrow("ntfy POST 500");
+  await expect(poll(122)).rejects.toThrow("skip: poll interval (last error: ntfy POST 500)");
+});
+
+test("a GitHub error with ntfy also down keeps the unit failing through a skipped run", async () => {
+  await poll(0);
+  ghStatus = 401;
+  ghPollInterval = "120";
+  ntfyFailOnce = 1;
+  await expect(poll(61)).rejects.toThrow("GitHub 401");
+  await expect(poll(122)).rejects.toThrow("skip: poll interval (last error: GitHub 401)");
+});
+
+test("a later success clears the failing state", async () => {
+  await poll(0);
+  ghStatus = 500;
+  await expect(poll(61)).rejects.toThrow("GitHub 500");
+  ghStatus = 200;
+  await poll(122);
+  expect(state().failing).toBeUndefined();
+});
+
+test("a 304 clears the failing state", async () => {
+  await poll(0);
+  ghStatus = 500;
+  await expect(poll(61)).rejects.toThrow("GitHub 500");
+  ghStatus = 304;
+  await poll(122);
+  expect(state().failing).toBeUndefined();
+});
+
+test("an unwritable state file stops the run before anything is sent", async () => {
+  await poll(0);
+  ghThreads = [thread("1", "mention", 30)];
+  mkdirSync(join(dir, "state.json.tmp"));
+  await expect(poll(61)).rejects.toThrow(/EISDIR/);
+  expect(sent).toHaveLength(0);
 });
 
 test("ntfy 429 counts as an outage, not a refusal", async () => {
